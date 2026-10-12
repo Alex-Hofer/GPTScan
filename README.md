@@ -24,12 +24,62 @@ solc-select use 0.8.19
 For example, if the source code is stored in the `/source` directory, run the command:
 
 ```shell
-python3.10 main.py -s /sourcecode -o /sourcecode/output.json -k OPEN_AI_API_KEY_xxxxxxxxxxxxx
+# Put your key in a .env file (recommended) and run with the default backend:
+python3.10 main.py -s /sourcecode -o /sourcecode/output.json
 ```
 
 3. Check the output
 
 The output results are located at the location specified by the `-o` parameter, in the example above, it is located at `/sourcecode/output.json`.
+
+## Choosing the LLM provider / model
+
+GPTScan talks to a single OpenAI-compatible Chat-Completions backend per run.
+Two providers ship out of the box (see `src/config.py` -> `PROVIDERS`):
+
+| Provider   | Cheap tier (default) | Strong tier        | Key (env var)      |
+|------------|----------------------|--------------------|--------------------|
+| `deepseek` | `deepseek-v4-flash`  | `deepseek-v4-pro`  | `DEEPSEEK_API_KEY` |
+| `openai`   | `gpt-3.5-turbo`      | `gpt-4`            | `OPENAI_API_KEY`   |
+
+The default backend is **`deepseek` / `deepseek-v4-flash`**.
+
+API keys are read from the environment, ideally a `.env` file (copy
+`.env.example` -> `.env`; `.env` is git-ignored). `-k` still works as a one-off
+override for the selected provider.
+
+```shell
+# DeepSeek (default) — key taken from .env
+python3.10 main.py -s /sourcecode -o out.json
+
+# Explicit provider + model
+python3.10 main.py -s /sourcecode -o out.json --provider deepseek --model deepseek-v4-pro
+
+# Keep using OpenAI (unchanged behaviour)
+python3.10 main.py -s /sourcecode -o out.json --provider openai --model gpt-4o
+```
+
+After every scan the summary prints the provider, model, number of LLM calls,
+tokens, and the estimated cost (also stored in `<output>.metadata.json`).
+Adding another OpenAI-compatible provider only means adding an entry to
+`PROVIDERS` (base URL, key env var, model tiers, prices).
+
+### Estimating cost before you spend — `--dry-run`
+
+A full scan can issue **hundreds of LLM calls per contract**. To see how many
+calls and roughly how much a scan would cost **without making any network call**
+(no API key needed), use `--dry-run`:
+
+```shell
+python3.10 main.py -s /sourcecode -o out.json --dry-run
+```
+
+The figures are a conservative upper bound (every scenario is assumed to match).
+Optional hard guards `MAX_LLM_CALLS` / `MAX_COST_USD` in `src/config.py` stop a
+live scan from issuing further calls once a limit is hit.
+
+> The DeepSeek prices in `src/config.py` are the official rates (v4-flash
+> $0.14 in / $0.28 out, v4-pro $1.74 in / $3.48 out, USD per 1M tokens).
 
 ## Supported Project Types
 

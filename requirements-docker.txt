@@ -1,0 +1,15 @@
+# Curated runtime dependencies for the GPTScan Docker image.
+#
+# The repository's requirements.txt is a full `pip freeze` from the original
+# authors' Ubuntu box and includes system packages (dbus-python, launchpadlib,
+# lazr.*, ...) that are NOT GPTScan dependencies and break a clean container
+# build. This file lists only what GPTScan actually imports; falcon-analyzer
+# pulls its own transitive deps (crytic-compile, z3, ...).
+
+openai==0.27.8
+tiktoken==0.4.0
+rich==13.7.1
+PyYAML==6.0
+antlr4-python3-runtime==4.12.0
+python-dotenv==1.0.1
+falcon-analyzer @ git+https://github.com/MetaTrustLabs/falcon-metatrust

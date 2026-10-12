@@ -3,6 +3,7 @@ import os
 import logging
 from typing import Dict, List, Tuple
 import config as global_config
+import llm_backend
 import datetime
 import json
 import falcon_adapter
@@ -107,6 +108,14 @@ def compile_project(abs_path:str):
 def simple_cli():
     start_time = time.time()
 
+    # Load secrets from a local .env (DEEPSEEK_API_KEY / OPENAI_API_KEY).
+    # .env is git-ignored; keys are never read from the source tree.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        logger.warning("python-dotenv not installed; relying on the ambient environment for API keys.")
+
     parser = argparse.ArgumentParser(
                     prog='GPTScan',
                     description='GPTScan is an AI based smart contract vulnerability scanner.')
@@ -114,13 +123,53 @@ def simple_cli():
     # not need ast, compile first
     # parser.add_argument("-a", "--ast", help="The AST directory", required=True)
     parser.add_argument("-o", "--output", help="The output file", required=True)
-    parser.add_argument("-k", "--gptkey", help="The OpenAI API key", required=True)
-    
-    
+    parser.add_argument("-k", "--gptkey",
+                        help="API key override. Prefer setting DEEPSEEK_API_KEY / OPENAI_API_KEY "
+                             "in .env; this flag overrides it for the chosen provider.",
+                        required=False, default=None)
+    parser.add_argument("--provider", choices=sorted(global_config.PROVIDERS.keys()),
+                        default=global_config.DEFAULT_PROVIDER,
+                        help=f"LLM provider (default: {global_config.DEFAULT_PROVIDER}).")
+    parser.add_argument("--model", default=None,
+                        help="Model id override (e.g. deepseek-v4-flash, deepseek-v4-pro, "
+                             "gpt-4o). Default: the provider's cheap tier.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Estimate the number of LLM calls and the cost WITHOUT making any "
+                             "network request. Needs no API key.")
+    parser.add_argument("--format", choices=("json", "md", "both"), default="json",
+                        help="Report format(s) to write next to -o (default: json).")
+
+    # NOTE: do not name this `args` -- the static-analysis loop below reuses a
+    # local `args = []`, which would clobber the parsed namespace.
+    cli_args = parser.parse_args()
+    source_dir = cli_args.source
+    output_file = cli_args.output
+    gptkey = cli_args.gptkey
+    report_format = cli_args.format
+    provider = cli_args.provider
+    model = cli_args.model
+    dry_run = cli_args.dry_run
+
+    # Select the backend and persist it into the environment so the analysis
+    # worker processes inherit it (see llm_backend for the rationale).
+    llm_backend.configure_from_args(provider, model, dry_run)
+    active_model = llm_backend.resolve_model(gpt4=False)
+
+    # Provide the API key (override -> provider env var). Dry runs need no key.
+    api_key_env = global_config.PROVIDERS[provider]["api_key_env"]
+    if gptkey:
+        os.environ[api_key_env] = gptkey
+    if not dry_run and not os.environ.get(api_key_env):
+        console.log(f"[bold red]No API key[/bold red] for provider '{provider}'. "
+                    f"Set {api_key_env} in .env or pass -k, or use --dry-run.")
+        sys.exit(1)
+
+    console.log(f"Provider: [bold cyan]{provider}[/bold cyan]  "
+                f"Model: [bold cyan]{active_model}[/bold cyan]  "
+                f"Mode: [bold cyan]{'DRY-RUN' if dry_run else 'live'}[/bold cyan]")
+
     scan_rules = load_all_rules()
     console.log(f"Loaded [bold green]{len(scan_rules)}[/bold green] rules")
-    
-    source_dir = parser.parse_args().source
 
     try:
         falcon_instance = compile_project(source_dir)
@@ -129,10 +178,6 @@ def simple_cli():
         console.log("Compile [bold red]failed[/bold red].")
         console.log("[yellow]Since the compilation is failed, some static analysis tool may not be enabled, which may cause lower precision and recall.[/yellow]")
         falcon_instance = None
-    output_file = parser.parse_args().output
-    gptkey = parser.parse_args().gptkey
-
-    os.environ["OPENAI_API_KEY"] = gptkey
 
     import analyze_pipeline
     import chatgpt_api
@@ -368,7 +413,30 @@ def simple_cli():
     meta_data["token_received"] = chatgpt_api.tokens_received.value # 接收的Token数量
     meta_data["token_sent_gpt4"] = chatgpt_api.tokens_sent_gpt4.value # 发送的Token数量
     meta_data["token_received_gpt4"] = chatgpt_api.tokens_received_gpt4.value # 接收的Token数量
-    meta_data["estimated_cost"] = (meta_data["token_sent"] * global_config.SEND_PRICE) + (meta_data["token_received"] * global_config.RECEIVE_PRICE) + (meta_data["token_sent_gpt4"] * global_config.GPT4_SEND_PRICE) + (meta_data["token_received_gpt4"] * global_config.GPT4_RECEIVE_PRICE)# 预估的花费
+    # Provider-aware cost (uses config.PROVIDERS prices for the active backend).
+    meta_data["estimated_cost"] = llm_backend.estimate_cost(
+        meta_data["token_sent"], meta_data["token_received"],
+        meta_data["token_sent_gpt4"], meta_data["token_received_gpt4"])
+
+    # Backend / budget bookkeeping.
+    meta_data["provider"] = provider
+    meta_data["model"] = active_model
+    meta_data["dry_run"] = bool(dry_run)
+    meta_data["llm_calls"] = int(chatgpt_api.num_llm_calls.value)
+    meta_data["llm_calls_skipped_budget"] = int(chatgpt_api.num_calls_skipped_budget.value)
+    meta_data["budget_exceeded"] = chatgpt_api.budget_exceeded_reason
+    meta_data["llm_calls_skipped_deadline"] = int(chatgpt_api.num_calls_skipped_deadline.value)
+    meta_data["deadline_exceeded"] = chatgpt_api.deadline_exceeded_reason
+    # The marker SmartBugs' parser looks for. Present only when the deadline
+    # actually cut the run short, so its absence means "this run was complete"
+    if chatgpt_api.deadline_exceeded_reason:
+        meta_data["sb_timeout"] = {
+            "hit": True,
+            "stage": "brake",
+            "detail": "{} LLM calls suppressed because the deadline passed: {}".format(
+                int(chatgpt_api.num_calls_skipped_deadline.value),
+                chatgpt_api.deadline_exceeded_reason),
+        }
 
     for metadata_key, metadata_value in meta_data.copy().items():
         if isinstance(metadata_value, set):
@@ -377,18 +445,43 @@ def simple_cli():
     # logger.info("============= Summary ===============")
     # logger.info(json.dumps(meta_data))
 
-    summary_table = Table(title="Summary")
+    title = "Dry-Run Estimate" if dry_run else "Summary"
+    summary_table = Table(title=title)
     summary_table.add_column("Key")
     summary_table.add_column("Value")
+    summary_table.add_row("Provider", str(meta_data["provider"]))
+    summary_table.add_row("Model", str(meta_data["model"]))
+    summary_table.add_row("Mode", "DRY-RUN (no calls made)" if dry_run else "live")
     summary_table.add_row("Files", str(meta_data["files"]))
     summary_table.add_row("Contracts", str(meta_data["contracts"]))
     summary_table.add_row("Functions", str(meta_data["functions"]))
     summary_table.add_row("Lines of Code", str(meta_data["loc"]))
     summary_table.add_row("Used Time", str(meta_data["used_time"]))
-    summary_table.add_row("Estimated Cost (USD)", str(meta_data["estimated_cost"]))
+    summary_table.add_row("LLM Calls" + (" (projected)" if dry_run else ""),
+                          str(meta_data["llm_calls"]))
+    summary_table.add_row("Tokens (sent / received)",
+                          f"{int(meta_data['token_sent'])} / {int(meta_data['token_received'])}")
+    summary_table.add_row("Estimated Cost (USD)" + (" (projected)" if dry_run else ""),
+                          f"{meta_data['estimated_cost']:.4f}")
+    if meta_data["budget_exceeded"]:
+        summary_table.add_row("Budget guard", f"[bold red]{meta_data['budget_exceeded']}[/bold red]")
 
     console.print(summary_table)
+    if dry_run:
+        console.print("[yellow]Dry-run figures are an upper-bound estimate "
+                      "(every scenario assumed to match); a live scan typically "
+                      "issues fewer calls.[/yellow]")
 
-
-    json.dump(output_json, open(output_file, "w"), indent=4)
-    json.dump(meta_data, open(output_file+".metadata.json", "w"), indent=4)
+    # ---- write reports --------------------------------------------------
+    if report_format in ("json", "both"):
+        json.dump(output_json, open(output_file, "w"), indent=4)
+        json.dump(meta_data, open(output_file+".metadata.json", "w"), indent=4)
+        console.log(f"JSON report: [green]{output_file}[/green]")
+    if report_format in ("md", "both"):
+        try:
+            import report_md
+            md_path = report_md.write_report(output_file, output_json, meta_data, scan_rules)
+            console.log(f"Markdown report: [green]{md_path}[/green]")
+        except Exception:
+            console.log("[red]Markdown report generation failed:[/red]")
+            console.log(traceback.format_exc())

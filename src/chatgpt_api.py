@@ -1,7 +1,7 @@
 import openai
 import openai.error
 from typing import List, Dict
-from config import OPENAI_APIS, GPT4_API
+import llm_backend
 import logging
 import time
 import traceback
@@ -23,6 +23,22 @@ tokens_received = Value("d", 0)
 tokens_sent_gpt4 = Value("d", 0)
 tokens_received_gpt4 = Value("d", 0)
 
+# Number of LLM calls actually issued (or, in --dry-run, that WOULD be issued).
+num_llm_calls = Value("i", 0)
+# Calls skipped because a hard budget guard tripped mid-scan.
+num_calls_skipped_budget = Value("i", 0)
+# Reason string once a budget guard tripped (parent process only); None = ok.
+budget_exceeded_reason = None
+
+# Calls suppressed because the SmartBugs deadline passed. Kept apart from
+# num_calls_skipped_budget so the metadata can say WHY a run stopped early.
+num_calls_skipped_deadline = Value("i", 0)
+
+# Set once in the parent process when the deadline guard first trips; None means
+# it never did. Plain global, not a Value: only the parent ever writes it, the
+# same way budget_exceeded_reason works.
+deadline_exceeded_reason = None
+
 
 class Chat:
     def __init__(self) -> None:
@@ -39,29 +55,18 @@ class Chat:
         
         self.currentSession.append({"role": "system", "content": SYSTEM_MESSAGE})
         self.currentSession.append({"role": "user", "content": message})
+        # Point the SDK at the active provider (sets api_key + api_base) and
+        # pick the model for this tier (cheap by default, strong when GPT4).
+        llm_backend.configure_sdk(openai)
+        model = llm_backend.resolve_model(gpt4=GPT4)
         while True:
             try:
-                if GPT4:
-                    openai.api_key = GPT4_API
-                    response = openai.ChatCompletion.create(
-                        # model="gpt-3.5-turbo-0301",
-                        # model="gpt-3.5-turbo-0613",
-                        # model="gpt-3.5-turbo",
-                        model="gpt-4",
-                        messages = self.currentSession,
-                        temperature = 0,
-                        top_p = 1.0
-                    )
-                else:
-                    response = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        # model="gpt-3.5-turbo-0613",
-                        # model="gpt-3.5-turbo",
-                        # model="gpt-4",
-                        messages = self.currentSession,
-                        temperature = 0,
-                        top_p = 1.0
-                    )
+                response = openai.ChatCompletion.create(
+                    model=model,
+                    messages=self.currentSession,
+                    temperature=0,
+                    top_p=1.0
+                )
                 break
             except openai.error.RateLimitError as e1:
                 logger.warning("Trigger rate limit error, sleep 30 sec")
@@ -69,7 +74,7 @@ class Chat:
             except openai.InvalidRequestError as e2:
                 if e2.code == 'context_length_exceeded':
                     logger.error("Too long context, skip")
-                    return "KeySentence: "
+                    return "KeySentence: ", {}
                 else:
                     logger.warning("Retry")
             except openai.error.APIConnectionError as e3:
@@ -87,27 +92,24 @@ class Chat:
         #     # temperature = 0.3
         # )
 
-        if GPT4:
-            global tokens_sent_gpt4
-            global tokens_received_gpt4
-
-            tokens_sent_gpt4.value += len(encoder.encode(SYSTEM_MESSAGE))
-            tokens_sent_gpt4.value += len(encoder.encode(message))
-            tokens_received_gpt4.value += len(encoder.encode(response['choices'][0]['message']['content']))
-        else:
-            global tokens_sent
-            global tokens_received
-
-            tokens_sent.value += len(encoder.encode(SYSTEM_MESSAGE))
-            tokens_sent.value += len(encoder.encode(message))
-            tokens_received.value += len(encoder.encode(response['choices'][0]['message']['content']))
-
+        content = response['choices'][0]['message']['content']
         self.currentSession.append(response['choices'][0]['message'])
 
-        console.print(rich_utils.make_response_panel(response['choices'][0]['message']['content'], "Response"))
-        
+        console.print(rich_utils.make_response_panel(content, "Response"))
 
-        return response['choices'][0]['message']['content']
+        # Return the actual API usage alongside the content. Token accounting is
+        # done parent-side in analyze_pipeline.ask_with_timeout (so counts cross
+        # the multiprocessing boundary on every platform). Reasoning models
+        # (e.g. deepseek-v4-flash) bill completion tokens that are NOT present in
+        # `content`, so a text-based estimate would badly undercount -- we use
+        # the API's usage when it is provided and fall back to estimation only
+        # when it is absent.
+        usage = response.get('usage') or {}
+        usage_d = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+        }
+        return content, usage_d
     
     def makeYesOrNoQuestion(self, question:str)->str:
         prompt = f"{question}. Please answer in one word, yes or no."

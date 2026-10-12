@@ -1,0 +1,16 @@
+# Never bake secrets or local cruft into the image.
+.env
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+# GPTScan local run artifacts
+callgraph.json
+dataflow.json
+project-config.json
+output/
+experiments/
+*.metadata.json

@@ -18,5 +18,7 @@ def make_args_table(args:List[str], title:str) -> Table:
         elif isinstance(arg, list):
             table.add_row(f"arg\[{index}]", "\[" + ", ".join(arg) + "]")
         else:
-            breakpoint()
+            # Was a stray debug breakpoint(); render unexpected arg types (e.g.
+            # None) safely so static-check display never blocks a headless run.
+            table.add_row(f"arg\[{index}]", str(arg))
     return table

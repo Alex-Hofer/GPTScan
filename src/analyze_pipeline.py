@@ -4,6 +4,8 @@ import multiprocessing
 from typing import List, Dict, Tuple
 from query_template import prompt_single_yes_no_question, prompt_multiple_choice_scenarios
 from chatgpt_api import Chat
+import chatgpt_api
+import llm_backend
 from utils import split_answer_section
 from antlr4helper import parseString
 from antlr4helper.callgraph import CallGraph
@@ -18,10 +20,81 @@ import rich_utils
 logger = logging.getLogger(__name__)
 console = rich.get_console()
 
-def ask_with_timeout(prompt, gpt4=False, timeout=90):
-    # logger.info(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-    # logger.info(f"Sending message: \n{prompt}")
-    # logger.info(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+def _count_tokens(text: str) -> int:
+    return len(chatgpt_api.encoder.encode(text))
+
+
+def _add_tokens(gpt4: bool, sent: float, received: float) -> None:
+    if gpt4:
+        chatgpt_api.tokens_sent_gpt4.value += sent
+        chatgpt_api.tokens_received_gpt4.value += received
+    else:
+        chatgpt_api.tokens_sent.value += sent
+        chatgpt_api.tokens_received.value += received
+
+
+def ask_with_timeout(prompt, gpt4=False, timeout=90, kind=None):
+    """Single metering point for every LLM call in GPTScan.
+
+    Runs in the parent process and spawns a worker for the actual request, so
+    token/call accounting, the budget guard and the --dry-run short-circuit all
+    live here and work regardless of the multiprocessing start method.
+
+    Live token counts use the API's reported usage (accurate for reasoning
+    models, whose completion tokens are not visible in the text); dry-run and
+    usage-less responses fall back to a tiktoken estimate.
+
+    ``kind`` ("choices" | "yesno" | static/None) identifies the call site for the
+    sentinel answers fed back when no call is issued: an upper-bound one in
+    --dry-run and after the budget guard, a neutral one after the deadline
+    guard. Either way the pipeline keeps traversing.
+    """
+    # Deterministic sent estimate: used for the budget pre-check and as a
+    # fallback when the API omits usage. Each call uses a fresh Chat() => the
+    # request is exactly system + user.
+    sent_est = _count_tokens(chatgpt_api.SYSTEM_MESSAGE) + _count_tokens(prompt)
+    dry_run = llm_backend.is_dry_run()
+
+    # Deadline guard (live runs only), the twin of the budget guard below: once
+    # the SmartBugs deadline has passed we stop issuing calls and return
+    # sentinels, so the scan still finishes and writes partial results instead
+    # of being killed with nothing to show. Checked in the parent for the same
+    # reason as the budget: it must hold regardless of the multiprocessing
+    # start method.
+    if not dry_run and chatgpt_api.deadline_exceeded_reason is None:
+        reason = llm_backend.deadline_exceeded()
+        if reason:
+            chatgpt_api.deadline_exceeded_reason = reason
+            logger.warning(
+                f"Deadline guard tripped: {reason}. Skipping all remaining LLM calls.")
+    if not dry_run and chatgpt_api.deadline_exceeded_reason is not None:
+        chatgpt_api.num_calls_skipped_deadline.value += 1
+        return llm_backend.deadline_sentinel(kind)
+
+    # Hard budget guard (live runs only). Once tripped we stop issuing calls and
+    # return sentinels so the scan still finishes and writes partial results.
+    if not dry_run and chatgpt_api.budget_exceeded_reason is None:
+        current_cost = llm_backend.estimate_cost(
+            chatgpt_api.tokens_sent.value, chatgpt_api.tokens_received.value,
+            chatgpt_api.tokens_sent_gpt4.value, chatgpt_api.tokens_received_gpt4.value)
+        reason = llm_backend.budget_exceeded(
+            int(chatgpt_api.num_llm_calls.value), current_cost)
+        if reason:
+            chatgpt_api.budget_exceeded_reason = reason
+            logger.warning(
+                f"Budget guard tripped: {reason}. Skipping all remaining LLM calls.")
+    if not dry_run and chatgpt_api.budget_exceeded_reason is not None:
+        chatgpt_api.num_calls_skipped_budget.value += 1
+        return llm_backend.dry_sentinel(kind)
+
+    chatgpt_api.num_llm_calls.value += 1
+
+    if dry_run:
+        # No network: estimate both directions, return a sentinel.
+        _add_tokens(gpt4, sent_est, llm_backend.AVG_COMPLETION_TOKENS)
+        return llm_backend.dry_sentinel(kind)
+
+    # Live call in a worker process so we can enforce the timeout.
     pool = multiprocessing.Pool(processes=1)
     process = pool.apply_async(Chat().sendMessages, args=(prompt, gpt4))
     pool.close()
@@ -31,11 +104,21 @@ def ask_with_timeout(prompt, gpt4=False, timeout=90):
             pool.terminate()
             raise TimeoutError("Timeout")
         if process.ready() == True:
-            res = process.get()
-            # logger.info("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
-            # logger.info(f"Received message: \n{res}")
-            # logger.info("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
-            return res
+            result = process.get()
+            # sendMessages returns (content, usage); tolerate a bare string.
+            if isinstance(result, tuple):
+                content, usage = result
+            else:
+                content, usage = result, {}
+            usage = usage or {}
+            sent_actual = usage.get("prompt_tokens")
+            recv_actual = usage.get("completion_tokens")
+            if sent_actual is None:
+                sent_actual = sent_est
+            if recv_actual is None:
+                recv_actual = _count_tokens(content)
+            _add_tokens(gpt4, sent_actual, recv_actual)
+            return content
 
 
 def ask_for_function_to_focus_with_feature_words_v2(source_dir: str, feature_words: List[List[str]]) -> Tuple[CallGraph, Dict[str, Dict[str, List[int]]]]:
@@ -299,7 +382,7 @@ def ask_whether_has_vul_with_scenario_v9(src_folder: str, rules: List[dict]) -> 
                         console.print(rich_utils.make_prompt_panel(function_data["source"], "\n".join(list(map(lambda x: x["property"][0], has_property_rules))), "Multiple Choice Scenarios"))
                         prompt = prompt_multiple_choice_scenarios(
                             list(map(lambda x: x["property"][0], has_property_rules)), function_data["source"])
-                        res = ask_with_timeout(prompt)
+                        res = ask_with_timeout(prompt, kind="choices")
                         answer = json.loads(res.split("}")[0]+"}")
                         for key, value in answer.items():
                             try:
@@ -318,7 +401,7 @@ def ask_whether_has_vul_with_scenario_v9(src_folder: str, rules: List[dict]) -> 
                                     has_property_rules[int_key-1]["property"][0]+" "+has_property_rules[int_key-1]["property"][1], function_data["source"])
                                 try:
                                     console.print(rich_utils.make_prompt_panel(function_data["source"], has_property_rules[int_key-1]["property"][0]+" "+has_property_rules[int_key-1]["property"][1], "Single Choice Scenario"))
-                                    res = ask_with_timeout(prompt)
+                                    res = ask_with_timeout(prompt, kind="yesno")
                                     # process answer
                                     if res.lower().startswith("yes"):
                                         meta_data["files_after_step_2"].add(file)
@@ -389,7 +472,7 @@ def ask_whether_has_vul_with_scenario_v9(src_folder: str, rules: List[dict]) -> 
                             list(map(lambda x: x["property"][0], rules_for_caller)), caller_c+"\n"+function_data["source"])
                         try:
                             console.print(rich_utils.make_prompt_panel(caller_c+"\n"+function_data["source"], "\n".join(list(map(lambda x: x["property"][0], rules_for_caller))), "Multiple Choice Scenarios"))
-                            res = ask_with_timeout(prompt)
+                            res = ask_with_timeout(prompt, kind="choices")
                             answer = json.loads(res.split("}")[0]+"}")
                         except TimeoutError:
                             logger.error(
@@ -425,7 +508,7 @@ def ask_whether_has_vul_with_scenario_v9(src_folder: str, rules: List[dict]) -> 
                                     rules_for_caller[int_key-1]["property"][0]+" "+rules_for_caller[int_key-1]["property"][1], caller_c+"\n"+function_data["source"])
                                 try:
                                     console.print(rich_utils.make_prompt_panel(caller_c+"\n"+function_data["source"], rules_for_caller[int_key-1]["property"][0]+" "+rules_for_caller[int_key-1]["property"][1], "Single Choice Scenario"))
-                                    res = ask_with_timeout(prompt)
+                                    res = ask_with_timeout(prompt, kind="yesno")
                                     # process answer
                                     if res.lower().startswith("yes"):
                                         meta_data["files_after_step_2"].add(file)
